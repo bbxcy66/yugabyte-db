@@ -10,7 +10,8 @@
  *-------------------------------------------------------------------------
  */
 
-#pragma once
+#ifndef YB_CATALOG_VERSION_H
+#define YB_CATALOG_VERSION_H
 
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
@@ -44,14 +45,21 @@ extern void YbCreateMasterDBCatalogVersionTableEntry(Oid db_oid);
 extern void YbDeleteMasterDBCatalogVersionTableEntry(Oid db_oid);
 
 /* Annotate an DML request if it changes the catalog data (if needed). */
-extern bool YbMarkStatementIfCatalogVersionIncrement(
-	YBCPgStatement ybc_stmt,
-	Relation rel);
-
-extern bool YbIsSystemCatalogChange(Relation rel);
+bool YbMarkStatementIfCatalogVersionIncrement(YBCPgStatement ybc_stmt,
+											  Relation rel);
 
 /* Return the catalog version type. */
-extern YbCatalogVersionType YbGetCatalogVersionType();
+YbCatalogVersionType YbGetCatalogVersionType();
 
 /* Get actual db_oid for pg_yb_catalog_version */
 Oid YbMasterCatalogVersionTableDBOid();
+
+/* Return the catalog version info that is fetched from the local tserver. */
+YbTserverCatalogInfo YbGetTserverCatalogVersionInfo();
+
+/*
+ * Return the tserver catalog version info of MyDatabaseId.
+ */
+YbTserverCatalogVersion *YbGetTserverCatalogVersion();
+
+#endif							/* YB_CATALOG_VERSION_H */

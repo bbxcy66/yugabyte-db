@@ -34,6 +34,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
+#include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -286,7 +287,16 @@ get_greaterstr(Datum prefix, Oid datatype, Oid colloid)
 		elog(ERROR, "no < operator for opfamily %u", opfamily);
 	fmgr_info(get_opcode(oproid), &ltproc);
 	prefix_const = text_to_const(prefix, colloid);
+#ifdef YB_TODO
+	/* YB_TODO(jasonk@yugabyte)
+	 * Postgres has stopped calling make_greater_string() in all backend executions. Need to
+	 * investigate if this call is the right thing to do.
+	 */
 	return make_greater_string(prefix_const, &ltproc, colloid);
+#else
+	/* This code is only for the compilation to proceed without errors */
+	return prefix_const;
+#endif
 }
 
 static void
@@ -471,8 +481,8 @@ addTargetSystemColumn(int attnum, YBCPgStatement handle)
 }
 
 /*
- * Add a regular column as target to the given statement handle if it is not
- * dropped.  Assume tupdesc's relation is the same as handle's target relation.
+ * Add a regular column as target to the given statement handle.  Assume
+ * tupdesc's relation is the same as handle's target relation.
  *
  * See related ybcAddTargetColumn.
  */
@@ -487,9 +497,6 @@ addTargetRegularColumn(TupleDesc tupdesc, int attnum, YBCPgStatement handle)
 	YBCPgTypeAttrs type_attrs;
 
 	att = TupleDescAttr(tupdesc, attnum - 1);
-	/* Ignore dropped attributes. */
-	if (att->attisdropped)
-		return;
 	type_attrs.typmod = att->atttypmod;
 	expr = YBCNewColumnRef(handle,
 						   attnum,
@@ -529,7 +536,7 @@ ybginSetupTargets(IndexScanDesc scan)
 	/*
 	 * For now, target all non-system columns of the base table.  This can be
 	 * very inefficient.  The lsm index access method avoids this using
-	 * filtering (see YbAddTargetColumnIfRequired).
+	 * filtering (see ybcAddTargetColumnIfRequired).
 	 *
 	 * TODO(jason): don't target unnecessary columns.
 	 */
@@ -568,7 +575,14 @@ ybginDoFirstExec(IndexScanDesc scan, ScanDirection dir)
 	/* targets */
 	ybginSetupTargets(scan);
 
-	YbSetCatalogCacheVersion(ybso->handle, YbGetCatalogCacheVersion());
+	/* syscatalog version */
+	if (YBIsDBCatalogVersionMode())
+		HandleYBStatus(YBCPgSetDBCatalogCacheVersion(ybso->handle,
+													 MyDatabaseId,
+													 yb_catalog_cache_version));
+	else
+		HandleYBStatus(YBCPgSetCatalogCacheVersion(ybso->handle,
+												   yb_catalog_cache_version));
 
 	/* execute select */
 	ybginExecSelect(scan, dir);
@@ -610,9 +624,12 @@ ybginFetchNextHeapTuple(IndexScanDesc scan)
 
 		tuple->t_tableOid = RelationGetRelid(scan->heapRelation);
 		if (syscols.ybctid != NULL)
-			tuple->t_ybctid = PointerGetDatum(syscols.ybctid);
+			HEAPTUPLE_YBCTID(tuple) = PointerGetDatum(syscols.ybctid);
+#ifdef YB_TODO
+		/* YB_TODO(jasonk@yugabyte) Set & get OID is no longer valid */
 		if (syscols.oid != InvalidOid)
 			HeapTupleSetOid(tuple, syscols.oid);
+#endif
 	}
 	pfree(values);
 	pfree(nulls);
@@ -637,12 +654,12 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 
 	/* fetch */
-	scan->xs_ctup.t_ybctid = 0;
+	YbItemPointerSetInvalid(&scan->xs_heaptid);
 	while (HeapTupleIsValid(tup = ybginFetchNextHeapTuple(scan)))
 	{
 		if (true)				/* TODO(jason): don't assume a match. */
 		{
-			scan->xs_ctup.t_ybctid = tup->t_ybctid;
+			YbItemPointerYbctid(&scan->xs_heaptid) = HEAPTUPLE_YBCTID(tup);
 			scan->xs_hitup = tup;
 			scan->xs_hitupdesc = RelationGetDescr(scan->heapRelation);
 
@@ -654,5 +671,5 @@ ybgingettuple(IndexScanDesc scan, ScanDirection dir)
 		heap_freetuple(tup);
 	}
 
-	return scan->xs_ctup.t_ybctid != 0;
+	return YbItemPointerYbctid(&scan->xs_heaptid) != 0;
 }

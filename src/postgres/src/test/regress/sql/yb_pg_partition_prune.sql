@@ -618,9 +618,6 @@ select * from tbl1 join tprt on tbl1.col1 > tprt.col1;
 explain (analyze, costs off, summary off, timing off)
 select * from tbl1 join tprt on tbl1.col1 = tprt.col1;
 
-/*+Set(yb_bnl_batch_size 1024)*/ explain (analyze, costs off, summary off, timing off)
-select * from tbl1 join tprt on tbl1.col1 = tprt.col1;
-
 select tbl1.col1, tprt.col1 from tbl1
 inner join tprt on tbl1.col1 > tprt.col1
 order by tbl1.col1, tprt.col1;
@@ -636,9 +633,6 @@ explain (analyze, costs off, summary off, timing off)
 select * from tbl1 inner join tprt on tbl1.col1 > tprt.col1;
 */
 explain (analyze, costs off, summary off, timing off)
-select * from tbl1 inner join tprt on tbl1.col1 = tprt.col1;
-
-/*+Set(yb_bnl_batch_size 1024)*/ explain (analyze, costs off, summary off, timing off)
 select * from tbl1 inner join tprt on tbl1.col1 = tprt.col1;
 
 select tbl1.col1, tprt.col1 from tbl1
@@ -664,9 +658,6 @@ order by tbl1.col1, tprt.col1;
 delete from tbl1;
 insert into tbl1 values (10000);
 explain (analyze, costs off, summary off, timing off)
-select * from tbl1 join tprt on tbl1.col1 = tprt.col1;
-
-/*+Set(yb_bnl_batch_size 1024)*/ explain (analyze, costs off, summary off, timing off)
 select * from tbl1 join tprt on tbl1.col1 = tprt.col1;
 
 select tbl1.col1, tprt.col1 from tbl1

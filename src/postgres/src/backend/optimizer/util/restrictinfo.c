@@ -3,7 +3,7 @@
  * restrictinfo.c
  *	  RestrictInfo node manipulation routines.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2021, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,31 +14,32 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_operator.h"
-#include "catalog/pg_type.h"
-
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/restrictinfo.h"
-#include "optimizer/var.h"
 
 
-static RestrictInfo *make_restrictinfo_internal(Expr *clause,
-						   Expr *orclause,
-						   bool is_pushed_down,
-						   bool outerjoin_delayed,
-						   bool pseudoconstant,
-						   Index security_level,
-						   Relids required_relids,
-						   Relids outer_relids,
-						   Relids nullable_relids);
-static Expr *make_sub_restrictinfos(Expr *clause,
-					   bool is_pushed_down,
-					   bool outerjoin_delayed,
-					   bool pseudoconstant,
-					   Index security_level,
-					   Relids required_relids,
-					   Relids outer_relids,
-					   Relids nullable_relids);
+static RestrictInfo *make_restrictinfo_internal(PlannerInfo *root,
+												Expr *clause,
+												Expr *orclause,
+												bool is_pushed_down,
+												bool outerjoin_delayed,
+												bool pseudoconstant,
+												Index security_level,
+												Relids required_relids,
+												Relids outer_relids,
+												Relids nullable_relids);
+static Expr *make_sub_restrictinfos(PlannerInfo *root,
+									Expr *clause,
+									bool is_pushed_down,
+									bool outerjoin_delayed,
+									bool pseudoconstant,
+									Index security_level,
+									Relids required_relids,
+									Relids outer_relids,
+									Relids nullable_relids);
 
 
 /*
@@ -57,7 +58,8 @@ static Expr *make_sub_restrictinfos(Expr *clause,
  * later.
  */
 RestrictInfo *
-make_restrictinfo(Expr *clause,
+make_restrictinfo(PlannerInfo *root,
+				  Expr *clause,
 				  bool is_pushed_down,
 				  bool outerjoin_delayed,
 				  bool pseudoconstant,
@@ -70,8 +72,9 @@ make_restrictinfo(Expr *clause,
 	 * If it's an OR clause, build a modified copy with RestrictInfos inserted
 	 * above each subclause of the top-level AND/OR structure.
 	 */
-	if (or_clause((Node *) clause))
-		return (RestrictInfo *) make_sub_restrictinfos(clause,
+	if (is_orclause(clause))
+		return (RestrictInfo *) make_sub_restrictinfos(root,
+													   clause,
 													   is_pushed_down,
 													   outerjoin_delayed,
 													   pseudoconstant,
@@ -81,9 +84,10 @@ make_restrictinfo(Expr *clause,
 													   nullable_relids);
 
 	/* Shouldn't be an AND clause, else AND/OR flattening messed up */
-	Assert(!and_clause((Node *) clause));
+	Assert(!is_andclause(clause));
 
-	return make_restrictinfo_internal(clause,
+	return make_restrictinfo_internal(root,
+									  clause,
 									  NULL,
 									  is_pushed_down,
 									  outerjoin_delayed,
@@ -100,7 +104,8 @@ make_restrictinfo(Expr *clause,
  * Common code for the main entry points and the recursive cases.
  */
 static RestrictInfo *
-make_restrictinfo_internal(Expr *clause,
+make_restrictinfo_internal(PlannerInfo *root,
+						   Expr *clause,
 						   Expr *orclause,
 						   bool is_pushed_down,
 						   bool outerjoin_delayed,
@@ -133,13 +138,20 @@ make_restrictinfo_internal(Expr *clause,
 		restrictinfo->leakproof = false;	/* really, "don't know" */
 
 	/*
+	 * Mark volatility as unknown.  The contain_volatile_functions function
+	 * will determine if there are any volatile functions when called for the
+	 * first time with this RestrictInfo.
+	 */
+	restrictinfo->has_volatile = VOLATILITY_UNKNOWN;
+
+	/*
 	 * If it's a binary opclause, set up left/right relids info. In any case
 	 * set up the total clause relids info.
 	 */
 	if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
 	{
-		restrictinfo->left_relids = pull_varnos(get_leftop(clause));
-		restrictinfo->right_relids = pull_varnos(get_rightop(clause));
+		restrictinfo->left_relids = pull_varnos(root, get_leftop(clause));
+		restrictinfo->right_relids = pull_varnos(root, get_rightop(clause));
 
 		restrictinfo->clause_relids = bms_union(restrictinfo->left_relids,
 												restrictinfo->right_relids);
@@ -166,7 +178,7 @@ make_restrictinfo_internal(Expr *clause,
 		restrictinfo->left_relids = NULL;
 		restrictinfo->right_relids = NULL;
 		/* and get the total relid set the hard way */
-		restrictinfo->clause_relids = pull_varnos((Node *) clause);
+		restrictinfo->clause_relids = pull_varnos(root, (Node *) clause);
 	}
 
 	/* required_relids defaults to clause_relids */
@@ -206,6 +218,8 @@ make_restrictinfo_internal(Expr *clause,
 	restrictinfo->right_bucketsize = -1;
 	restrictinfo->left_mcvfreq = -1;
 	restrictinfo->right_mcvfreq = -1;
+
+	restrictinfo->hasheqoperator = InvalidOid;
 
 	return restrictinfo;
 }
@@ -252,12 +266,8 @@ get_batched_restrictinfo(RestrictInfo *rinfo,
 		}
 	}
 
-	/*
-	 * Make sure this clause involves both outer_batched_relids and
-	 * inner_relids.
-	 */
-	if (!bms_overlap(ret->right_relids, outer_batched_relids) ||
-		!bms_overlap(ret->left_relids, inner_relids))
+	/* Make sure this satisfies the outer_batched_relids constraint. */
+	if (!bms_overlap(ret->clause_relids, outer_batched_relids))
 		return NULL;
 
 	return ret;
@@ -281,7 +291,8 @@ get_batched_restrictinfo(RestrictInfo *rinfo,
  * contained rels.
  */
 static Expr *
-make_sub_restrictinfos(Expr *clause,
+make_sub_restrictinfos(PlannerInfo *root,
+					   Expr *clause,
 					   bool is_pushed_down,
 					   bool outerjoin_delayed,
 					   bool pseudoconstant,
@@ -290,14 +301,15 @@ make_sub_restrictinfos(Expr *clause,
 					   Relids outer_relids,
 					   Relids nullable_relids)
 {
-	if (or_clause((Node *) clause))
+	if (is_orclause(clause))
 	{
 		List	   *orlist = NIL;
 		ListCell   *temp;
 
 		foreach(temp, ((BoolExpr *) clause)->args)
 			orlist = lappend(orlist,
-							 make_sub_restrictinfos(lfirst(temp),
+							 make_sub_restrictinfos(root,
+													lfirst(temp),
 													is_pushed_down,
 													outerjoin_delayed,
 													pseudoconstant,
@@ -305,7 +317,8 @@ make_sub_restrictinfos(Expr *clause,
 													NULL,
 													outer_relids,
 													nullable_relids));
-		return (Expr *) make_restrictinfo_internal(clause,
+		return (Expr *) make_restrictinfo_internal(root,
+												   clause,
 												   make_orclause(orlist),
 												   is_pushed_down,
 												   outerjoin_delayed,
@@ -315,14 +328,15 @@ make_sub_restrictinfos(Expr *clause,
 												   outer_relids,
 												   nullable_relids);
 	}
-	else if (and_clause((Node *) clause))
+	else if (is_andclause(clause))
 	{
 		List	   *andlist = NIL;
 		ListCell   *temp;
 
 		foreach(temp, ((BoolExpr *) clause)->args)
 			andlist = lappend(andlist,
-							  make_sub_restrictinfos(lfirst(temp),
+							  make_sub_restrictinfos(root,
+													 lfirst(temp),
 													 is_pushed_down,
 													 outerjoin_delayed,
 													 pseudoconstant,
@@ -333,7 +347,8 @@ make_sub_restrictinfos(Expr *clause,
 		return make_andclause(andlist);
 	}
 	else
-		return (Expr *) make_restrictinfo_internal(clause,
+		return (Expr *) make_restrictinfo_internal(root,
+												   clause,
 												   NULL,
 												   is_pushed_down,
 												   outerjoin_delayed,
@@ -342,6 +357,71 @@ make_sub_restrictinfos(Expr *clause,
 												   required_relids,
 												   outer_relids,
 												   nullable_relids);
+}
+
+/*
+ * commute_restrictinfo
+ *
+ * Given a RestrictInfo containing a binary opclause, produce a RestrictInfo
+ * representing the commutation of that clause.  The caller must pass the
+ * OID of the commutator operator (which it's presumably looked up, else
+ * it would not know this is valid).
+ *
+ * Beware that the result shares sub-structure with the given RestrictInfo.
+ * That's okay for the intended usage with derived index quals, but might
+ * be hazardous if the source is subject to change.  Also notice that we
+ * assume without checking that the commutator op is a member of the same
+ * btree and hash opclasses as the original op.
+ */
+RestrictInfo *
+commute_restrictinfo(RestrictInfo *rinfo, Oid comm_op)
+{
+	RestrictInfo *result;
+	OpExpr	   *newclause;
+	OpExpr	   *clause = castNode(OpExpr, rinfo->clause);
+
+	Assert(list_length(clause->args) == 2);
+
+	/* flat-copy all the fields of clause ... */
+	newclause = makeNode(OpExpr);
+	memcpy(newclause, clause, sizeof(OpExpr));
+
+	/* ... and adjust those we need to change to commute it */
+	newclause->opno = comm_op;
+	newclause->opfuncid = InvalidOid;
+	newclause->args = list_make2(lsecond(clause->args),
+								 linitial(clause->args));
+
+	/* likewise, flat-copy all the fields of rinfo ... */
+	result = makeNode(RestrictInfo);
+	memcpy(result, rinfo, sizeof(RestrictInfo));
+
+	/*
+	 * ... and adjust those we need to change.  Note in particular that we can
+	 * preserve any cached selectivity or cost estimates, since those ought to
+	 * be the same for the new clause.  Likewise we can keep the source's
+	 * parent_ec.
+	 */
+	result->clause = (Expr *) newclause;
+	result->left_relids = rinfo->right_relids;
+	result->right_relids = rinfo->left_relids;
+	Assert(result->orclause == NULL);
+	result->left_ec = rinfo->right_ec;
+	result->right_ec = rinfo->left_ec;
+	result->left_em = rinfo->right_em;
+	result->right_em = rinfo->left_em;
+	result->scansel_cache = NIL;	/* not worth updating this */
+	if (rinfo->hashjoinoperator == clause->opno)
+		result->hashjoinoperator = comm_op;
+	else
+		result->hashjoinoperator = InvalidOid;
+	result->left_bucketsize = rinfo->right_bucketsize;
+	result->right_bucketsize = rinfo->left_bucketsize;
+	result->left_mcvfreq = rinfo->right_mcvfreq;
+	result->right_mcvfreq = rinfo->left_mcvfreq;
+	result->hasheqoperator = InvalidOid;
+
+	return result;
 }
 
 /*
@@ -379,218 +459,31 @@ restriction_is_securely_promotable(RestrictInfo *restrictinfo,
 		return false;
 }
 
-/* Simple integer comparison function. */
-static int _exprcol_cmp(const void *a, const void *b, void *cxt)
-{
-	int a_int = ((Var *) get_leftop(*((const Expr**) a)))->varattno;
-	int b_int = ((Var *) get_leftop(*((const Expr**) b)))->varattno;
-
-	return a_int - b_int;
-}
-
-/*
- * Takes a list of batched clauses (those with clauses of the form
- * var1 = BatchedExpr(f(o_var1, o_var2...)))) and zips them up to form
- * one singular batched clause of the form
- * (var1, var2 ...) =
- * BatchedExpr(f1(o_var1, o_var2...), f2(o_var1, o_var2...)...)
- * where the LHS is sorted ascendingly by attribute number.
- */
-static Expr *zip_batched_exprs(List *b_exprs)
-{
-	Assert(b_exprs != NIL);
-	if (list_length(b_exprs) == 1)
-	{
-		return linitial(b_exprs);
-	}
-
-	Expr **exprcols =
-		palloc(sizeof(Expr*) * list_length(b_exprs));
-
-	int i = 0;
-	ListCell *lc;
-	foreach(lc, b_exprs)
-	{
-		Expr *b_expr = lfirst(lc);
-		exprcols[i] = b_expr;
-		i++;
-	}
-
-	/* Sort based on index column. */
-	qsort_arg(exprcols, list_length(b_exprs), sizeof(Expr*),
-			  _exprcol_cmp, NULL);
-
-	/*
-	 * v1 = BatchedExpr(f1(o)) AND v2 = BatchedExpr(f2(o))
-	 * becomes ROW(v1, v2) = BatchedExpr(ROW(f1(o),f2(o)))
-	 */
-
-	RowExpr *leftop = makeNode(RowExpr);
-	RowExpr *rightop = makeNode(RowExpr);
-
-	Oid opresulttype = -1;
-	bool opretset = false;
-	Oid opcolloid = -1;
-	Oid inputcollid = -1;
-
-	for (i = 0; i < list_length(b_exprs); i++)
-	{
-		Expr *b_expr = (Expr *) exprcols[i];
-		OpExpr *opexpr = (OpExpr *) b_expr;
-		opresulttype = opexpr->opresulttype;
-		opretset = opexpr->opretset;
-		opcolloid = opexpr->opcollid;
-		inputcollid = opexpr->inputcollid;
-
-		Var *left_var = (Var *) get_leftop(b_expr);
-		leftop->args = lappend(leftop->args, left_var);
-
-		Expr *right_expr =
-			(Expr *) ((YbBatchedExpr *) get_rightop(b_expr))->orig_expr;
-		rightop->args = lappend(rightop->args, right_expr);
-	}
-
-	pfree(exprcols);
-
-	leftop->colnames = NIL;
-	leftop->row_format = COERCE_EXPLICIT_CALL;
-	leftop->row_typeid = RECORDOID;
-
-	rightop->colnames = NIL;
-	rightop->row_format = COERCE_EXPLICIT_CALL;
-	rightop->row_typeid = RECORDOID;
-
-	YbBatchedExpr *right_batched_expr = makeNode(YbBatchedExpr);
-	right_batched_expr->orig_expr = (Expr*) rightop;
-
-	return (Expr*) make_opclause(RECORD_EQ_OP, opresulttype, opretset,
-						 		 (Expr*) leftop, (Expr*) right_batched_expr,
-						 		 opcolloid, inputcollid);
-}
-
-/* 
- * Add a given batched RestrictInfo to rinfo if it hasn't already been added.
- */
-void add_batched_rinfo(RestrictInfo *rinfo, RestrictInfo *batched)
-{
-	ListCell *lc;
-	foreach(lc, rinfo->yb_batched_rinfo)
-	{
-		RestrictInfo *current = lfirst(lc);
-		/* If we already have a batched clause with this LHS we don't bother.*/
-		if (equal(get_leftop(current->clause), get_leftop(batched->clause)))
-			return;	
-	}
-
-	rinfo->yb_batched_rinfo = lappend(rinfo->yb_batched_rinfo, batched);
-}
-
-
 List *
-yb_get_actual_batched_clauses(PlannerInfo *root,
-										List *restrictinfo_list,
-										Path *inner_path)
+get_actual_batched_clauses(Relids batchedrelids,
+						   List *restrictinfo_list,
+						   IndexPath *inner_index)
 {
-	Relids 		batchedrelids = root->yb_cur_batched_relids;
 	List	   *result = NIL;
 	ListCell   *l;
-	ListCell   *lc;
 
-	Relids inner_req_rels = PATH_REQ_OUTER(inner_path);
-
-	/*
-	 * We only zip up clauses involving outer relations A and B if they can
-	 * be found under the same element in yb_availBatchedRelids.
-	 */
-	
-	Relids cumulative_rels = NULL;
-	foreach(lc, root->yb_availBatchedRelids)
+	foreach(l, restrictinfo_list)
 	{
-		Relids cur_relgroup = (Relids) lfirst(lc);
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
+		RestrictInfo *tmp_batched =
+			get_batched_restrictinfo(rinfo,
+									 batchedrelids,
+									 inner_index->indexinfo->rel->relids);
 
-		/* Check if clause will be even relevant to this relgroup. */
-		if (!bms_overlap(cur_relgroup, inner_req_rels))
-			continue;
-
-		/* Check to make sure we haven't already seen these rels. */
-		if (bms_is_subset(cur_relgroup, cumulative_rels))
-			continue;
-
-		Assert(!bms_overlap(cur_relgroup, cumulative_rels));
-
-		cumulative_rels = bms_add_members(cumulative_rels, cur_relgroup);
-		List *batched_list = NIL;
-		List *batched_rinfos = NIL;
-
-		Index security_level;
-		Relids required_relids = NULL;
-		Relids outer_relids = NULL;
-		Relids nullable_relids = NULL;
-
-		foreach(l, restrictinfo_list)
+		if (tmp_batched)
 		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
-			security_level = rinfo->security_level;
-			RestrictInfo *tmp_batched =
-				get_batched_restrictinfo(rinfo,
-					batchedrelids,
-					inner_path->parent->relids);
-
-			if (tmp_batched)
-			{
-				if (!bms_overlap(tmp_batched->clause_relids, cur_relgroup))
-					continue;
-
-				batched_list =
-					list_append_unique_ptr(batched_list, tmp_batched->clause);
-				required_relids =
-					bms_union(required_relids, tmp_batched->required_relids);
-				outer_relids =
-					bms_union(outer_relids, tmp_batched->outer_relids);
-				nullable_relids =
-					bms_union(nullable_relids, tmp_batched->nullable_relids);
-				batched_rinfos = lappend(batched_rinfos, rinfo);
-				continue;
-			}
-
-			Assert(!rinfo->pseudoconstant);
-
-			result = lappend(result, rinfo->clause);
+			rinfo = tmp_batched;
 		}
 
-		if (!batched_list)
-		{
-			continue;
-		}
+		Assert(!rinfo->pseudoconstant);
 
-		Expr *zipped = zip_batched_exprs(batched_list);
-		result = lappend(result, zipped);
-
-		/* This is needed to make this method idempotent. */
-		if (list_length(batched_rinfos) == 1)
-		{
-			bms_free(required_relids);
-			bms_free(outer_relids);
-			bms_free(nullable_relids);
-			continue;
-		}
-
-		RestrictInfo *zipped_rinfo =
-			make_restrictinfo(zipped, false, false, false, security_level,
-							required_relids, outer_relids, nullable_relids);
-
-		foreach(l, batched_rinfos)
-		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, l);
-			list_free(rinfo->yb_batched_rinfo);
-			rinfo->yb_batched_rinfo = list_make1(zipped_rinfo);
-		}
-
-		bms_free(required_relids);
-		bms_free(outer_relids);
-		bms_free(nullable_relids);
+		result = lappend(result, rinfo->clause);
 	}
-
 	return result;
 }
 
